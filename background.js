@@ -34,7 +34,124 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
     return true;
   }
+
+  if (message.type === "IV_PROBE_MANIFESTS") {
+    const urls = Array.isArray(message.urls) ? message.urls : [];
+    if (!urls.length) {
+      sendResponse({ ok: true, results: [] });
+      return true;
+    }
+
+    probeManifestCandidates(urls)
+      .then((results) => {
+        sendResponse({ ok: true, results });
+      })
+      .catch((error) => {
+        sendResponse({ ok: false, error: String(error), results: [] });
+      });
+    return true;
+  }
+
+  if (message.type === "IV_DOWNLOAD_URL") {
+    const url = message.url;
+    const filename = message.filename;
+    const saveAs = !!message.saveAs;
+    if (!url) {
+      sendResponse({ ok: false, error: "Missing url" });
+      return true;
+    }
+
+    chrome.downloads.download(
+      {
+        url,
+        filename: filename || undefined,
+        saveAs,
+        conflictAction: "uniquify",
+      },
+      (downloadId) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        sendResponse({ ok: true, downloadId: Number(downloadId) || null });
+      },
+    );
+    return true;
+  }
 });
+
+async function probeManifestCandidates(urls) {
+  const unique = Array.from(new Set(urls)).slice(0, 20);
+  const results = [];
+
+  for (const url of unique) {
+    const hit = await probeManifest(url);
+    if (hit) results.push(hit);
+  }
+
+  return results.sort((a, b) => b.score - a.score);
+}
+
+async function probeManifest(url) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Range: "bytes=0-4095",
+      },
+    });
+  } catch (error) {
+    return null;
+  }
+
+  if (!response || !response.ok) return null;
+
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  let bodyStart = "";
+  try {
+    bodyStart = (await response.text()).slice(0, 2048).toLowerCase();
+  } catch (error) {
+    bodyStart = "";
+  }
+
+  const lowerUrl = String(url).toLowerCase();
+  const hasHlsSig =
+    lowerUrl.includes(".m3u8") ||
+    contentType.includes("mpegurl") ||
+    bodyStart.includes("#extm3u");
+  const hasDashSig =
+    lowerUrl.includes(".mpd") ||
+    contentType.includes("dash+xml") ||
+    bodyStart.includes("<mpd") ||
+    bodyStart.includes("<mpd ");
+
+  if (!hasHlsSig && !hasDashSig) return null;
+
+  let score = 40;
+  const reasons = ["reachable"];
+
+  if (hasHlsSig) {
+    score += 45;
+    reasons.push("hls-signature");
+  }
+  if (hasDashSig) {
+    score += 45;
+    reasons.push("dash-signature");
+  }
+
+  if (/master|playlist|manifest|index|stream/.test(lowerUrl)) {
+    score += 10;
+    reasons.push("manifest-like-name");
+  }
+
+  return {
+    url,
+    type: hasHlsSig ? "hls" : "dash",
+    score,
+    reasons,
+  };
+}
 
 async function fetchManifest(url) {
   const response = await fetch(url);

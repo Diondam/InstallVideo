@@ -2,20 +2,47 @@
   const SOURCE = "InstallVideo";
   const MAX_LINKS_PER_VIDEO = 120;
   const MAX_SEGMENTS_PER_VIDEO = 30;
+  const MAX_MANIFEST_PROBE_URLS = 20;
+  const MANIFEST_PROBE_NAMES = [
+    "master.m3u8",
+    "index.m3u8",
+    "playlist.m3u8",
+    "manifest.m3u8",
+    "stream.m3u8",
+    "dash.mpd",
+    "manifest.mpd",
+  ];
+  const SETTINGS_KEY = "ivDownloadSettings";
+  const DEFAULT_SETTINGS = {
+    downloadSubfolder: "",
+    askEachTime: false,
+  };
 
   let localCounter = 1;
   let lastActiveVideoId = null;
   let floatingInfoEl = null;
+  let extensionSettings = { ...DEFAULT_SETTINGS };
   const netUrlOwner = new Map();
   const expandedGroupKeys = new Set();
 
   const videoStore = new Map(); // id -> { el, overlay, links: Map(url->link), duration }
   const manifestRequested = new Set();
 
+  initSettings();
   injectPageScript();
   installMessageListener();
   scanVideos();
   observeVideoMutations();
+
+  function initSettings() {
+    chrome.storage.local.get(SETTINGS_KEY, (data) => {
+      const saved = data && data[SETTINGS_KEY] ? data[SETTINGS_KEY] : null;
+      extensionSettings = {
+        ...DEFAULT_SETTINGS,
+        ...(saved && typeof saved === "object" ? saved : {}),
+      };
+    });
+  }
 
   function injectPageScript() {
     const src = chrome.runtime.getURL("page_inject.js");
@@ -92,6 +119,7 @@
       links: new Map(),
       sources: new Set(),
       duration: null,
+       segmentProbeBases: new Set(),
     });
   }
 
@@ -118,14 +146,32 @@
     const panel = document.createElement("div");
     panel.className = "iv-panel";
 
+    const titleBar = document.createElement("div");
+    titleBar.className = "iv-titlebar";
+
     const title = document.createElement("div");
     title.className = "iv-title";
     title.textContent = "InstallVideo Links";
 
+    const settingsBtn = document.createElement("button");
+    settingsBtn.type = "button";
+    settingsBtn.className = "iv-settings-btn";
+    settingsBtn.title = "Cài đặt thư mục tải";
+    settingsBtn.setAttribute("aria-label", "Cài đặt thư mục tải");
+    settingsBtn.textContent = "";
+    settingsBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openDownloadSettings();
+    });
+
+    titleBar.appendChild(title);
+    titleBar.appendChild(settingsBtn);
+
     const list = document.createElement("div");
     list.className = "iv-list";
 
-    panel.appendChild(title);
+    panel.appendChild(titleBar);
     panel.appendChild(list);
 
     overlay.appendChild(button);
@@ -171,6 +217,37 @@
     }
 
     parent.appendChild(overlay);
+  }
+
+  function openDownloadSettings() {
+    const currentFolder = extensionSettings.downloadSubfolder || "";
+    const input = window.prompt(
+      "Nhập thư mục con để lưu trong Downloads (vd: InstallVideo).\nĐể trống = lưu trực tiếp vào Downloads mặc định.",
+      currentFolder,
+    );
+    if (input === null) return;
+
+    const normalizedFolder = normalizeSubfolder(input);
+    const askEachTime = window.confirm(
+      "Bạn có muốn bật hộp thoại chọn nơi lưu cho MỖI lần tải không?\nOK = Có, Cancel = Không",
+    );
+
+    extensionSettings = {
+      downloadSubfolder: normalizedFolder,
+      askEachTime,
+    };
+
+    chrome.storage.local.set({ [SETTINGS_KEY]: extensionSettings });
+  }
+
+  function normalizeSubfolder(value) {
+    if (!value || typeof value !== "string") return "";
+    return value
+      .trim()
+      .replace(/\\+/g, "/")
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.\./g, "")
+      .replace(/\s+/g, " ");
   }
 
   function handleMediaMeta(data) {
@@ -345,6 +422,10 @@
     if (link.type === "file") {
       requestHeadSize(videoId, link.url);
     }
+ 
+      if (classification.type === "segment") {
+        requestSegmentManifestInference(videoId, link.url);
+      }
 
     renderLinks(videoId);
   }
@@ -440,6 +521,136 @@
         link.size = response.size;
         renderLinks(videoId);
       }
+ 
+       function requestSegmentManifestInference(videoId, segmentUrl) {
+         const store = ensureStore(videoId);
+         if (!store || !segmentUrl) return;
+ 
+         const baseKey = getSegmentBaseKey(segmentUrl);
+         if (!baseKey) return;
+ 
+         if (!store.segmentProbeBases) {
+           store.segmentProbeBases = new Set();
+         }
+         if (store.segmentProbeBases.has(baseKey)) return;
+         store.segmentProbeBases.add(baseKey);
+ 
+         const probes = buildManifestProbeUrls(segmentUrl).slice(0, MAX_MANIFEST_PROBE_URLS);
+         if (!probes.length) return;
+ 
+         chrome.runtime.sendMessage(
+           { type: "IV_PROBE_MANIFESTS", urls: probes },
+           (response) => {
+             if (!response || !response.ok || !Array.isArray(response.results)) return;
+             applyInferredManifestCandidates(videoId, response.results);
+           },
+         );
+       }
+ 
+       function applyInferredManifestCandidates(videoId, candidates) {
+         const store = ensureStore(videoId);
+         if (!store) return;
+ 
+         let changed = false;
+ 
+         for (const item of candidates) {
+           if (!item || !item.url) continue;
+           const inferredType = item.type === "dash" ? "dash" : "hls";
+           const classification = inferredType === "dash"
+             ? { type: "dash", label: "DASH" }
+             : { type: "hls", label: "HLS" };
+ 
+           const existing = store.links.get(item.url);
+           if (existing) {
+             mergeLink(existing, {
+               ...classification,
+               source: "segment-infer",
+               inferScore: Number.isFinite(item.score) ? item.score : null,
+               inferReason: Array.isArray(item.reasons) ? item.reasons.join(",") : null,
+             });
+             changed = true;
+           } else {
+             const link = {
+               url: item.url,
+               source: "segment-infer",
+               initiatorType: null,
+               addedAt: Date.now(),
+               drm: false,
+               isLive: false,
+               duration: store.duration || null,
+               size: null,
+               qualities: null,
+               inferScore: Number.isFinite(item.score) ? item.score : null,
+               inferReason: Array.isArray(item.reasons) ? item.reasons.join(",") : null,
+               ...classification,
+             };
+             store.links.set(item.url, link);
+             netUrlOwner.set(item.url, videoId);
+             changed = true;
+           }
+ 
+           requestManifestParse(videoId, item.url);
+         }
+ 
+         if (changed) {
+           renderLinks(videoId);
+         }
+       }
+ 
+       function getSegmentBaseKey(segmentUrl) {
+         try {
+           const parsed = new URL(segmentUrl, window.location.href);
+           const parts = parsed.pathname.split("/").filter(Boolean);
+           if (!parts.length) return `${parsed.origin}/`;
+           parts.pop();
+           return `${parsed.origin}/${parts.join("/")}/`;
+         } catch (e) {
+           return null;
+         }
+       }
+ 
+       function buildManifestProbeUrls(segmentUrl) {
+         let parsed;
+         try {
+           parsed = new URL(segmentUrl, window.location.href);
+         } catch (e) {
+           return [];
+         }
+ 
+         const results = new Set();
+         const paths = parsed.pathname.split("/").filter(Boolean);
+         if (!paths.length) return [];
+ 
+         const fileName = paths[paths.length - 1] || "";
+         const dirParts = paths.slice(0, -1);
+ 
+         const parentBases = [];
+         for (let i = dirParts.length; i >= Math.max(0, dirParts.length - 2); i--) {
+           const prefix = dirParts.slice(0, i).join("/");
+           parentBases.push(`${parsed.origin}/${prefix ? `${prefix}/` : ""}`);
+         }
+ 
+         for (const base of parentBases) {
+           for (const name of MANIFEST_PROBE_NAMES) {
+             results.add(new URL(name, base).toString());
+           }
+         }
+ 
+         const normalized = fileName.replace(/\.([a-z0-9]{2,5})$/i, "");
+         const stripped = normalized
+           .replace(/[_-]?(seg|segment|chunk|frag|part)[_-]?\d+$/i, "")
+           .replace(/[_-]?\d{2,6}$/i, "")
+           .trim();
+ 
+         if (stripped) {
+           for (const base of parentBases) {
+             results.add(new URL(`${stripped}.m3u8`, base).toString());
+             results.add(new URL(`${stripped}.mpd`, base).toString());
+           }
+         }
+ 
+         return Array.from(results);
+       }
     });
   }
 
@@ -615,6 +826,25 @@
           copyToClipboard(link.url);
         });
 
+        const canDownloadManifest =
+          link.type === "hls" ||
+          link.type === "hls-variant" ||
+          (typeof link.url === "string" && link.url.toLowerCase().includes(".m3u8"));
+
+        const downloadBtn = document.createElement("button");
+        downloadBtn.className = "iv-download-mini";
+        downloadBtn.type = "button";
+        downloadBtn.textContent = "";
+        downloadBtn.title = "Tải m3u8";
+        downloadBtn.setAttribute("aria-label", "Tải m3u8");
+        downloadBtn.disabled = !canDownloadManifest;
+        downloadBtn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!canDownloadManifest) return;
+          downloadM3u8Link(link);
+        });
+
         const main = document.createElement("div");
         main.className = "iv-main";
 
@@ -651,6 +881,7 @@
         infoWrap.appendChild(infoBtn);
 
         item.appendChild(copy);
+        item.appendChild(downloadBtn);
         item.appendChild(main);
         item.appendChild(infoWrap);
 
@@ -870,6 +1101,41 @@
     tag.className = `iv-tag ${className || ""}`.trim();
     tag.textContent = text;
     return tag;
+  }
+
+  function downloadM3u8Link(link) {
+    if (!link || !link.url) return;
+
+    const fileName = buildDownloadFileName(link.url);
+    const safeFolder = normalizeSubfolder(extensionSettings.downloadSubfolder || "");
+    const filename = safeFolder ? `${safeFolder}/${fileName}` : fileName;
+
+    chrome.runtime.sendMessage(
+      {
+        type: "IV_DOWNLOAD_URL",
+        url: link.url,
+        filename,
+        saveAs: !!extensionSettings.askEachTime,
+      },
+      (response) => {
+        if (!response || !response.ok) {
+          const reason = response && response.error ? `\n${response.error}` : "";
+          window.alert(`Không thể tải m3u8.${reason}`);
+        }
+      },
+    );
+  }
+
+  function buildDownloadFileName(url) {
+    try {
+      const parsed = new URL(url, window.location.href);
+      const raw = parsed.pathname.split("/").filter(Boolean).pop() || "playlist.m3u8";
+      const clean = raw.replace(/[<>:"|?*\\]/g, "_");
+      if (clean.toLowerCase().endsWith(".m3u8")) return clean;
+      return `${clean || "playlist"}.m3u8`;
+    } catch (e) {
+      return `playlist-${Date.now()}.m3u8`;
+    }
   }
 
   function copyToClipboard(text) {

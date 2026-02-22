@@ -3,7 +3,7 @@
   "name": "InstallVideo Stream Finder",
   "version": "0.1.0",
   "description": "Finds video stream links on pages and overlays per-video controls.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "downloads"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
