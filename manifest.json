@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "InstallVideo Stream Finder",
+  "version": "0.1.0",
+  "description": "Finds video stream links on pages and overlays per-video controls.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page_inject.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_title": "InstallVideo"
+  }
+}
