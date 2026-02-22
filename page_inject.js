@@ -1,6 +1,7 @@
 (function () {
   const SOURCE = "InstallVideo";
   let counter = 1;
+  let activeVideoId = null;
   const observed = new WeakSet();
 
   function post(type, payload) {
@@ -21,11 +22,21 @@
     const id = ensureId(el);
     if (!id) return;
 
+    const markActive = () => {
+      activeVideoId = id;
+    };
+
+    el.addEventListener("mouseenter", markActive, { passive: true });
+    el.addEventListener("pointerdown", markActive, { passive: true });
+    el.addEventListener("playing", markActive, { passive: true });
+
     el.addEventListener("play", () => {
+      activeVideoId = id;
       post("IV_MEDIA_PLAY", { id });
     });
 
     el.addEventListener("loadedmetadata", () => {
+      activeVideoId = id;
       post("IV_MEDIA_META", {
         id,
         duration: Number.isFinite(el.duration) ? el.duration : null,
@@ -52,9 +63,9 @@
     );
   }
 
-  function handleUrl(url, initiatorType) {
+  function handleUrl(url, initiatorType, videoId) {
     if (!isVideoLikeUrl(url)) return;
-    post("IV_NET_REQUEST", { url, initiatorType });
+    post("IV_NET_REQUEST", { url, initiatorType, id: videoId || activeVideoId || null });
   }
 
   function patchFetch() {
@@ -64,7 +75,7 @@
       try {
         const input = args[0];
         const url = typeof input === "string" ? input : input && input.url;
-        if (url) handleUrl(url, "fetch");
+        if (url) handleUrl(url, "fetch", null);
       } catch (e) {}
       return originalFetch.apply(this, args);
     };
@@ -81,7 +92,7 @@
 
     XMLHttpRequest.prototype.send = function (...args) {
       if (this.__iv_url) {
-        handleUrl(this.__iv_url, "xmlhttprequest");
+        handleUrl(this.__iv_url, "xmlhttprequest", null);
       }
       return originalSend.apply(this, args);
     };
@@ -98,6 +109,7 @@
           set(value) {
             const id = ensureId(this);
             if (id && value) {
+              activeVideoId = id;
               post("IV_MEDIA_SRC", { id, url: String(value) });
             }
             return desc.set.call(this, value);
@@ -111,6 +123,7 @@
       if (this instanceof HTMLMediaElement && name === "src") {
         const id = ensureId(this);
         if (id && value) {
+          activeVideoId = id;
           post("IV_MEDIA_SRC", { id, url: String(value) });
         }
       }
@@ -124,7 +137,7 @@
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           if (entry && entry.name) {
-            handleUrl(entry.name, entry.initiatorType);
+            handleUrl(entry.name, entry.initiatorType, null);
           }
         }
       });

@@ -5,6 +5,9 @@
 
   let localCounter = 1;
   let lastActiveVideoId = null;
+  let floatingInfoEl = null;
+  const netUrlOwner = new Map();
+  const expandedGroupKeys = new Set();
 
   const videoStore = new Map(); // id -> { el, overlay, links: Map(url->link), duration }
   const manifestRequested = new Set();
@@ -104,10 +107,13 @@
     const overlay = document.createElement("div");
     overlay.className = "iv-overlay";
     overlay.dataset.ivId = videoId;
+    overlay.dataset.ivPinned = "0";
 
-    const button = document.createElement("div");
+    const button = document.createElement("button");
     button.className = "iv-button";
-    button.title = "InstallVideo: show links";
+    button.type = "button";
+    button.title = "InstallVideo: toggle panel";
+    button.setAttribute("aria-label", "Download links");
 
     const panel = document.createElement("div");
     panel.className = "iv-panel";
@@ -125,12 +131,29 @@
     overlay.appendChild(button);
     overlay.appendChild(panel);
 
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const isPinned = overlay.dataset.ivPinned === "1";
+      if (isPinned) {
+        overlay.dataset.ivPinned = "0";
+        overlay.classList.remove("iv-pinned");
+        overlay.classList.remove("iv-open");
+      } else {
+        overlay.dataset.ivPinned = "1";
+        overlay.classList.add("iv-pinned");
+        overlay.classList.add("iv-open");
+        renderLinks(videoId);
+      }
+    });
+
     overlay.addEventListener("mouseenter", () => {
       overlay.classList.add("iv-open");
       renderLinks(videoId);
     });
 
     overlay.addEventListener("mouseleave", () => {
+      if (overlay.dataset.ivPinned === "1") return;
       overlay.classList.remove("iv-open");
     });
 
@@ -153,6 +176,7 @@
   function handleMediaMeta(data) {
     const { id, duration, currentSrc } = data;
     if (!id) return;
+    lastActiveVideoId = id;
 
     const store = ensureStore(id);
     if (store && Number.isFinite(duration)) {
@@ -171,6 +195,7 @@
   function handleMediaSrc(data) {
     const { id, url } = data;
     if (!id || !url) return;
+    lastActiveVideoId = id;
     const store = ensureStore(id);
     if (store && store.sources) {
       store.sources.add(url);
@@ -179,12 +204,25 @@
   }
 
   function handleNetRequest(data) {
-    const { url, initiatorType } = data;
+    const { id: hintedId, url, initiatorType } = data;
     if (!url) return;
-    const id = findVideoIdForUrl(url) || pickTargetVideoId();
+    const normalized = normalizeUrl(url);
+    if (!normalized) return;
+
+    const id =
+      resolveHintedVideoId(hintedId) ||
+      netUrlOwner.get(normalized) ||
+      pickTargetVideoId() ||
+      findVideoIdForUrl(normalized);
+
     if (!id) return;
 
-    addLinkForVideo(id, url, { source: "net", initiatorType });
+    addLinkForVideo(id, normalized, { source: "net", initiatorType });
+  }
+
+  function resolveHintedVideoId(id) {
+    if (!id) return null;
+    return videoStore.has(id) ? id : null;
   }
 
   function pickTargetVideoId() {
@@ -198,34 +236,48 @@
   }
 
   function findVideoIdForUrl(url) {
-    const origin = safeOrigin(url);
-    if (!origin) return null;
+    const parsed = safeParsedUrl(url);
+    if (!parsed) return null;
+
+    let bestId = null;
+    let bestScore = 0;
 
     for (const [id, store] of videoStore.entries()) {
       if (!store) continue;
 
+      let score = 0;
+
       if (store.sources && store.sources.size) {
         for (const src of store.sources) {
-          if (safeOrigin(src) === origin) {
-            return id;
-          }
+          const s = safeParsedUrl(src);
+          if (!s) continue;
+          if (s.href === parsed.href) score = Math.max(score, 100);
+          else if (s.host === parsed.host) score = Math.max(score, 30);
+          else if (s.origin === parsed.origin) score = Math.max(score, 20);
         }
       }
 
       if (store.links && store.links.size) {
         for (const link of store.links.values()) {
-          if (link && link.url && safeOrigin(link.url) === origin) {
-            return id;
-          }
+          const l = link && link.url ? safeParsedUrl(link.url) : null;
+          if (!l) continue;
+          if (l.href === parsed.href) score = Math.max(score, 90);
+          else if (l.host === parsed.host) score = Math.max(score, 25);
         }
       }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestId = id;
+      }
     }
-    return null;
+
+    return bestScore >= 25 ? bestId : null;
   }
 
-  function safeOrigin(value) {
+  function safeParsedUrl(value) {
     try {
-      return new URL(value, window.location.href).origin;
+      return new URL(value, window.location.href);
     } catch (e) {
       return null;
     }
@@ -284,6 +336,7 @@
     };
 
     store.links.set(cleaned, link);
+    netUrlOwner.set(cleaned, videoId);
 
     if (link.type === "hls" || link.type === "dash") {
       requestManifestParse(videoId, link.url);
@@ -505,79 +558,304 @@
       return;
     }
 
-    links.forEach((link) => {
-      const item = document.createElement("div");
-      item.className = "iv-link";
+    const groups = groupLinksByFormat(links);
+    for (const group of groups) {
+      const groupKey = `${videoId}:${group.name}`;
+      const isExpanded = expandedGroupKeys.has(groupKey);
 
-      const rowTop = document.createElement("div");
-      rowTop.className = "iv-row";
+      const section = document.createElement("div");
+      section.className = "iv-group";
 
-      const label = document.createElement("div");
-      label.textContent = buildLabel(link);
+      const heading = document.createElement("div");
+      heading.className = "iv-group-title";
+      const headingText = document.createElement("span");
+      headingText.className = "iv-group-label";
+      headingText.textContent = `${group.name} (${group.items.length})`;
 
-      const copy = document.createElement("button");
-      copy.className = "iv-copy";
-      copy.textContent = "Copy";
-      copy.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        copyToClipboard(link.url);
+      const hiddenCount = Math.max(0, group.items.length - 1);
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "iv-group-toggle";
+      toggle.textContent = isExpanded
+        ? "Collapse"
+        : hiddenCount > 0
+          ? `Expand +${hiddenCount}`
+          : "Expand";
+      toggle.disabled = group.items.length <= 1;
+      toggle.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (expandedGroupKeys.has(groupKey)) {
+          expandedGroupKeys.delete(groupKey);
+        } else {
+          expandedGroupKeys.add(groupKey);
+        }
+        renderLinks(videoId);
       });
 
-      rowTop.appendChild(label);
-      rowTop.appendChild(copy);
+      heading.appendChild(headingText);
+      heading.appendChild(toggle);
+      section.appendChild(heading);
 
-      const urlRow = document.createElement("div");
-      urlRow.className = "iv-url";
-      urlRow.textContent = link.url;
+      const visibleItems = isExpanded ? group.items : group.items.slice(0, 1);
 
-      const metaRow = document.createElement("div");
-      metaRow.className = "iv-meta";
+      visibleItems.forEach((link) => {
+        const item = document.createElement("div");
+        item.className = "iv-item";
 
-      const metaText = document.createElement("span");
-      metaText.className = "iv-meta-text";
-      metaText.textContent = buildMeta(link);
+        const copy = document.createElement("button");
+        copy.className = "iv-copy-mini";
+        copy.type = "button";
+        copy.textContent = "";
+        copy.title = "Copy link";
+        copy.setAttribute("aria-label", "Copy link");
+        copy.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          copyToClipboard(link.url);
+        });
 
-      const tagWrap = document.createElement("span");
-      tagWrap.className = "iv-meta-tags";
+        const main = document.createElement("div");
+        main.className = "iv-main";
 
-      const tags = buildTags(link);
-      if (tags.length) {
-        tags.forEach((tag) => tagWrap.appendChild(tag));
-      }
+        const name = document.createElement("div");
+        name.className = "iv-name";
+        name.textContent = getCompactFileName(link.url);
 
-      metaRow.appendChild(metaText);
-      metaRow.appendChild(tagWrap);
+        const quick = document.createElement("div");
+        quick.className = "iv-quick";
+        quick.textContent = buildCompactMeta(link);
 
-      item.appendChild(rowTop);
-      item.appendChild(urlRow);
-      item.appendChild(metaRow);
+        main.appendChild(name);
+        main.appendChild(quick);
 
-      list.appendChild(item);
-    });
+        const infoWrap = document.createElement("div");
+        infoWrap.className = "iv-info-wrap";
+
+        const infoBtn = document.createElement("button");
+        infoBtn.className = "iv-info-btn";
+        infoBtn.type = "button";
+        infoBtn.textContent = "";
+        infoBtn.setAttribute("aria-label", "More info");
+
+        infoBtn.addEventListener("mouseenter", () => {
+          showFloatingInfo(link, infoBtn);
+        });
+        infoBtn.addEventListener("mousemove", (event) => {
+          moveFloatingInfo(event.clientX, event.clientY);
+        });
+        infoBtn.addEventListener("mouseleave", () => {
+          hideFloatingInfo();
+        });
+
+        infoWrap.appendChild(infoBtn);
+
+        item.appendChild(copy);
+        item.appendChild(main);
+        item.appendChild(infoWrap);
+
+        section.appendChild(item);
+      });
+
+      list.appendChild(section);
+    }
   }
 
-  function buildLabel(link) {
-    const parts = [];
-    parts.push(link.label || link.type || "LINK");
+  function groupLinksByFormat(links) {
+    const order = ["HLS", "DASH", "FILE", "SEGMENT", "BLOB", "MANIFEST", "OTHER"];
+    const map = new Map();
+    for (const link of links) {
+      const key = getGroupName(link);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(link);
+    }
 
+    return Array.from(map.entries())
+      .sort((a, b) => {
+        const ai = order.indexOf(a[0]);
+        const bi = order.indexOf(b[0]);
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      })
+      .map(([name, items]) => ({ name, items: sortGroupItems(name, items) }));
+  }
+
+  function sortGroupItems(groupName, items) {
+    const arr = Array.isArray(items) ? [...items] : [];
+    if (groupName === "HLS") {
+      arr.sort((a, b) => compareHlsPriority(b, a));
+      return arr;
+    }
+    arr.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+    return arr;
+  }
+
+  function compareHlsPriority(a, b) {
+    const qa = getHlsQualityMetrics(a);
+    const qb = getHlsQualityMetrics(b);
+    if (qa.bandwidth !== qb.bandwidth) return qa.bandwidth - qb.bandwidth;
+    if (qa.pixels !== qb.pixels) return qa.pixels - qb.pixels;
+    if (qa.variantRank !== qb.variantRank) return qa.variantRank - qb.variantRank;
+    return (qa.addedAt || 0) - (qb.addedAt || 0);
+  }
+
+  function getHlsQualityMetrics(link) {
+    const bandwidth = Number.isFinite(link?.bandwidth) ? link.bandwidth : 0;
+    let width = Number.isFinite(link?.width) ? link.width : 0;
+    let height = Number.isFinite(link?.height) ? link.height : 0;
+
+    if ((!width || !height) && link?.resolution) {
+      const match = String(link.resolution).match(/(\d+)\s*x\s*(\d+)/i);
+      if (match) {
+        width = Number(match[1]) || 0;
+        height = Number(match[2]) || 0;
+      }
+    }
+
+    const pixels = width * height;
+    const variantRank = link?.type === "hls-variant" ? 1 : 0;
+    return {
+      bandwidth,
+      pixels,
+      variantRank,
+      addedAt: link?.addedAt || 0,
+    };
+  }
+
+  function getGroupName(link) {
+    if (!link) return "OTHER";
+    if (link.type === "hls" || link.type === "hls-variant") return "HLS";
+    if (link.type === "dash") return "DASH";
+    if (link.type === "file") return "FILE";
+    if (link.type === "segment") return "SEGMENT";
+    if (link.type === "blob") return "BLOB";
+    if (link.type === "manifest") return "MANIFEST";
+    return "OTHER";
+  }
+
+  function getCompactFileName(url) {
+    const fallback = "(no-name)";
+    if (!url) return fallback;
+    try {
+      const parsed = new URL(url, window.location.href);
+      const fileName = parsed.pathname.split("/").filter(Boolean).pop() || fallback;
+      if (fileName.length <= 28) return fileName;
+      return `...${fileName.slice(-25)}`;
+    } catch (e) {
+      if (url.length <= 28) return url;
+      return `...${url.slice(-25)}`;
+    }
+  }
+
+  function buildCompactMeta(link) {
+    const parts = [];
+    if (link.duration) parts.push(formatDuration(link.duration));
+    if (link.size) parts.push(formatBytes(link.size));
     if (link.resolution) parts.push(link.resolution);
     if (link.width && link.height) parts.push(`${link.width}x${link.height}`);
     if (link.bandwidth) parts.push(formatBandwidth(link.bandwidth));
-    if (link.type === "blob") parts.push("local");
-
-    return parts.join(" · ");
+    if (link.isLive) parts.push("LIVE");
+    if (link.drm) parts.push("DRM");
+    return parts.join(" · ") || "—";
   }
 
-  function buildMeta(link) {
-    const meta = [];
-    if (link.duration) meta.push(`Duration: ${formatDuration(link.duration)}`);
-    if (link.size) meta.push(`Size: ${formatBytes(link.size)}`);
-    if (link.qualities && link.qualities.length) {
-      meta.push(`Qualities: ${link.qualities.join(", ")}`);
+  function ensureFloatingInfo() {
+    if (floatingInfoEl) return floatingInfoEl;
+    const el = document.createElement("div");
+    el.className = "iv-floating-info";
+    document.documentElement.appendChild(el);
+    floatingInfoEl = el;
+    return el;
+  }
+
+  function showFloatingInfo(link, anchor) {
+    const el = ensureFloatingInfo();
+    renderFloatingInfo(link, el);
+    el.classList.add("iv-show");
+
+    if (anchor && anchor.getBoundingClientRect) {
+      const rect = anchor.getBoundingClientRect();
+      moveFloatingInfo(rect.right + 8, rect.top + 8);
     }
-    if (link.initiatorType) meta.push(`Source: ${link.initiatorType}`);
-    return meta.join(" | ") || "—";
+  }
+
+  function renderFloatingInfo(link, container) {
+    container.innerHTML = "";
+
+    const header = document.createElement("div");
+    header.className = "iv-fi-head";
+    header.textContent = link.label || link.type || "LINK";
+    container.appendChild(header);
+
+    appendInfoRow(container, "URL", link.url, "url");
+    appendInfoRow(container, "Duration", link.duration ? formatDuration(link.duration) : null);
+    appendInfoRow(container, "Size", link.size ? formatBytes(link.size) : null);
+    appendInfoRow(container, "Bandwidth", link.bandwidth ? formatBandwidth(link.bandwidth) : null);
+    appendInfoRow(container, "Resolution", link.resolution || null);
+    appendInfoRow(
+      container,
+      "Frame",
+      link.width && link.height ? `${link.width}x${link.height}` : null,
+    );
+    appendInfoRow(container, "Codecs", link.codecs || null, "code");
+    appendInfoRow(
+      container,
+      "Qualities",
+      Array.isArray(link.qualities) && link.qualities.length
+        ? link.qualities.join(", ")
+        : null,
+      "quality",
+    );
+    appendInfoRow(container, "Source", link.initiatorType || null);
+    appendInfoRow(container, "DRM", link.drm ? "yes" : "no", link.drm ? "warn" : "ok");
+    appendInfoRow(container, "Live", link.isLive ? "yes" : "no", link.isLive ? "live" : "ok");
+  }
+
+  function appendInfoRow(container, key, value, tone) {
+    if (value === null || value === undefined || value === "") return;
+    const row = document.createElement("div");
+    row.className = "iv-fi-row";
+
+    const k = document.createElement("span");
+    k.className = "iv-fi-key";
+    k.textContent = key;
+
+    const v = document.createElement("span");
+    v.className = `iv-fi-val ${tone ? `is-${tone}` : ""}`.trim();
+    v.textContent = String(value);
+
+    row.appendChild(k);
+    row.appendChild(v);
+    container.appendChild(row);
+  }
+
+  function moveFloatingInfo(clientX, clientY) {
+    if (!floatingInfoEl || !floatingInfoEl.classList.contains("iv-show")) return;
+
+    const pad = 12;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const maxW = Math.min(440, Math.floor(vw * 0.7));
+    floatingInfoEl.style.maxWidth = `${maxW}px`;
+
+    let left = clientX + 12;
+    let top = clientY + 12;
+
+    const rect = floatingInfoEl.getBoundingClientRect();
+    if (left + rect.width > vw - pad) {
+      left = Math.max(pad, clientX - rect.width - 12);
+    }
+    if (top + rect.height > vh - pad) {
+      top = Math.max(pad, vh - rect.height - pad);
+    }
+
+    floatingInfoEl.style.left = `${left}px`;
+    floatingInfoEl.style.top = `${top}px`;
+  }
+
+  function hideFloatingInfo() {
+    if (!floatingInfoEl) return;
+    floatingInfoEl.classList.remove("iv-show");
   }
 
   function buildTags(link) {
